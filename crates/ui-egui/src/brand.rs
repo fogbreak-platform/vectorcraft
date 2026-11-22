@@ -4,15 +4,9 @@
 
 use egui::{Color32, Context, Id, Rect, TextureHandle, TextureOptions, Ui, pos2};
 
-/// 128 px: sharp at 44 pt on a 2× display, and the mipmaps keep 22 pt clean.
-const ICON_PNG: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.vectorcraft.png");
-
-/// The icon's pixels (one transparent pixel if it couldn't be decoded, which a test rules out).
+/// Clean-room 1x1 transparent placeholder (no upstream animal icon asset).
 fn decode() -> egui::ColorImage {
-    match craft_image_codecs::decode_as(craft_image_codecs::Format::Png, ICON_PNG) {
-        Ok(img) => egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img.to_rgba8()),
-        Err(_) => egui::ColorImage::filled([1, 1], Color32::TRANSPARENT),
-    }
+    egui::ColorImage::filled([1, 1], Color32::TRANSPARENT)
 }
 
 /// The icon texture, uploaded on first use and kept in the context.

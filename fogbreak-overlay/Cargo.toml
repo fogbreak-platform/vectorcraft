@@ -1,0 +1,43 @@
+[package]
+name = "fogbreak-vector"
+description = "Fogbreak Vector Studio (browser WebGPU with WebGL2 fallback, page canvas host)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.95"
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fogbreak-vector"
+path = "src/main.rs"
+
+[dependencies]
+egui = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+vectorcraft-engine = { workspace = true, features = ["bundled-fonts", "heif"] }
+vectorcraft-format = { workspace = true }
+vectorcraft-text = { workspace = true }
+vectorcraft-ui-egui = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "Location",
+    "MediaQueryList",
+    "Event",
+    "EventTarget",
+    "CustomEvent",
+    "CustomEventInit",
+] }

@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>Fogbreak Vector Studio</title>
+  <link data-trunk rel="rust" data-bin="fogbreak-vector" data-wasm-opt="z" data-weak-refs />
+  <style>
+    :root {
+      --fb-bg: #F7FAFC;
+      --fb-ink: #111821;
+      --fb-accent: #087F9C;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --fb-bg: #111821;
+        --fb-ink: #F7FAFC;
+      }
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--fb-bg);
+      color: var(--fb-ink);
+      overscroll-behavior: none;
+    }
+    #fogbreak_vector_canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+    #fogbreak_vector_loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font: 500 14px system-ui, -apple-system, sans-serif;
+      color: var(--fb-ink);
+      pointer-events: none;
+    }
+    #fogbreak_vector_loading::before {
+      content: "";
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--fb-accent);
+    }
+  </style>
+</head>
+<body>
+  <canvas
+    id="fogbreak_vector_canvas"
+    data-host="page"
+    data-engine="fogbreak-vector"
+    data-rpc-key="fogbreakVectorHost"
+    data-iframe="false"
+  ></canvas>
+  <div id="fogbreak_vector_loading">Loading Fogbreak Vector Studio&hellip;</div>
+</body>
+</html>
