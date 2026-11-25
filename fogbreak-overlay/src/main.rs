@@ -14,16 +14,18 @@ mod web {
     use vectorcraft_engine::Session;
     use vectorcraft_ui_egui::{Inbox, Services, VectorcraftApp};
 
-    use crate::host_bridge::{self, LOADING_ID};
+    use crate::host_bridge::{self, IoQueue, LOADING_ID};
     use crate::theme::apply_palette;
 
     struct Shell {
         app: VectorcraftApp,
+        io_queue: IoQueue,
         dark: bool,
     }
 
     impl eframe::App for Shell {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            self.io_queue.drain_into(&mut self.app);
             self.app.tick(ctx);
             self.app.finish_ime_logic(ctx);
             apply_palette(ctx, self.dark);
@@ -87,14 +89,19 @@ mod web {
                     options,
                     Box::new(move |cc| {
                         let page_inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
+                        let io_queue = IoQueue::default();
                         let session = Session::new();
                         let capabilities: Vec<String> = session
                             .commands()
                             .into_iter()
-                            .take(64)
                             .map(|c| c.id.to_string())
                             .collect();
-                        let control_rx = host_bridge::install_rpc(cc.egui_ctx.clone(), page_inbox.clone(), capabilities.clone());
+                        let control_rx = host_bridge::install_rpc(
+                            cc.egui_ctx.clone(),
+                            page_inbox.clone(),
+                            io_queue.clone(),
+                            capabilities.clone(),
+                        );
                         host_bridge::listen_open(&canvas, page_inbox.clone(), cc.egui_ctx.clone());
 
                         let services = Services {
@@ -108,7 +115,7 @@ mod web {
                         let app = VectorcraftApp::new(session, services).with_control(control_rx);
                         apply_palette(&cc.egui_ctx, dark);
                         host_bridge::emit_ready(&capabilities);
-                        Ok(Box::new(Shell { app, dark }))
+                        Ok(Box::new(Shell { app, io_queue, dark }))
                     }),
                 )
                 .await;

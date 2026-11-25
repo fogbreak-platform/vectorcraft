@@ -3,20 +3,105 @@
 #![forbid(unsafe_code)]
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use serde_json::{Value, json};
-use vectorcraft_ui_egui::{ControlRequest, ControlTicket, Inbox};
+use vectorcraft_ui_egui::{ControlRequest, ControlTicket, Inbox, VectorcraftApp};
 use wasm_bindgen::JsCast as _;
+use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
 pub const ENGINE_ID: &str = "fogbreak-vector";
 pub const HOST_KEY: &str = "fogbreakVectorHost";
 pub const CANVAS_ID: &str = "fogbreak_vector_canvas";
 pub const LOADING_ID: &str = "fogbreak_vector_loading";
+
+const EXPORT_FORMATS: [&str; 5] = ["svg", "pdf", "eps", "png", "ai"];
+
+pub enum IoJob {
+    Describe {
+        command: String,
+        tx: Sender<Value>,
+    },
+    Export {
+        format: String,
+        params: Value,
+        tx: Sender<Result<Vec<u8>, String>>,
+    },
+    Import {
+        name: String,
+        bytes: Vec<u8>,
+        tx: Sender<Result<Value, String>>,
+    },
+}
+
+#[derive(Clone, Default)]
+pub struct IoQueue {
+    items: Rc<RefCell<Vec<IoJob>>>,
+}
+
+impl IoQueue {
+    pub fn push(&self, job: IoJob) {
+        self.items.borrow_mut().push(job);
+    }
+
+    pub fn drain_into(&self, app: &mut VectorcraftApp) {
+        let items: Vec<IoJob> = self.items.borrow_mut().drain(..).collect();
+        for job in items {
+            match job {
+                IoJob::Describe { command, tx } => {
+                    let _ = tx.send(describe_command_json(app, &command));
+                }
+                IoJob::Export { format, params, tx } => {
+                    let _ = tx.send(export_bytes(app, &format, &params));
+                }
+                IoJob::Import { name, bytes, tx } => {
+                    let _ = tx.send(import_bytes(app, &name, &bytes));
+                }
+            }
+        }
+    }
+}
+
+fn describe_command_json(app: &VectorcraftApp, command: &str) -> Value {
+    let spec = vectorcraft_engine::find_command(command).or_else(|| {
+        vectorcraft_engine::command_specs()
+            .iter()
+            .find(|c| c.id.eq_ignore_ascii_case(command))
+    });
+    let Some(spec) = spec else {
+        return Value::Null;
+    };
+    let info = spec.info(&app.session);
+    let mut val = serde_json::to_value(&info).unwrap_or_else(|_| json!({ "id": spec.id, "label": spec.label }));
+    if let Some(map) = val.as_object_mut() {
+        map.insert("summary".to_string(), Value::String(spec.label.to_string()));
+        map.insert("mutates".to_string(), Value::Bool(spec.journal));
+    }
+    val
+}
+
+fn export_bytes(app: &VectorcraftApp, format: &str, params: &Value) -> Result<Vec<u8>, String> {
+    let fmt = format.trim().trim_start_matches('.').to_ascii_lowercase();
+    if !matches!(fmt.as_str(), "svg" | "pdf" | "eps" | "png" | "ai") {
+        return Err(format!("unsupported export format `{fmt}`"));
+    }
+    let st = app.session.active().ok_or_else(|| "no active document".to_string())?;
+    vectorcraft_engine::cmd::fileio::encode(&st.doc, &fmt, params).map_err(|e| e.to_string())
+}
+
+fn import_bytes(app: &mut VectorcraftApp, name: &str, bytes: &[u8]) -> Result<Value, String> {
+    let result = vectorcraft_ui_egui::io::open_bytes(app, name, bytes, None)?;
+    Ok(json!({
+        "ok": true,
+        "name": name,
+        "byteLength": bytes.len(),
+        "result": result,
+    }))
+}
 
 thread_local! {
     static CANVAS_REF: RefCell<Option<web_sys::HtmlCanvasElement>> = const { RefCell::new(None) };
@@ -146,22 +231,40 @@ fn dispatch_canvas_event(name: &str, detail: &JsValue) {
     });
 }
 
-pub fn install_rpc(ctx: egui::Context, inbox: Inbox, capabilities: Vec<String>) -> Receiver<ControlRequest> {
+pub fn install_rpc(
+    ctx: egui::Context,
+    inbox: Inbox,
+    io_queue: IoQueue,
+    capabilities: Vec<String>,
+) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
     let Some(window) = web_sys::window() else { return rx };
     let handle = Object::new();
     let _ = Reflect::set(&handle, &"hostMode".into(), &JsValue::from_str("page"));
     let _ = Reflect::set(&handle, &"engineId".into(), &JsValue::from_str(ENGINE_ID));
 
-    {
-        let req_tx = tx.clone();
-        let req_ctx = ctx.clone();
-        let req_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |method: String, params: JsValue| {
-            dispatch_rpc(req_tx.clone(), req_ctx.clone(), method, parse_params(&params))
-        });
-        let _ = Reflect::set(&handle, &"request".into(), req_fn.as_ref().unchecked_ref());
-        req_fn.forget();
-    }
+    install_request_fns(&handle, &tx, &ctx, &io_queue, capabilities);
+    install_inspect_fns(&handle, &tx, &ctx);
+    install_io_fns(&handle, inbox, &io_queue, &ctx);
+
+    let _ = Reflect::set(&window, &JsValue::from_str(HOST_KEY), &handle);
+    rx
+}
+
+fn install_request_fns(
+    handle: &Object,
+    tx: &Sender<ControlRequest>,
+    ctx: &egui::Context,
+    io_queue: &IoQueue,
+    capabilities: Vec<String>,
+) {
+    let req_tx = tx.clone();
+    let req_ctx = ctx.clone();
+    let req_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |method: String, params: JsValue| {
+        dispatch_rpc(req_tx.clone(), req_ctx.clone(), method, parse_params(&params))
+    });
+    let _ = Reflect::set(handle, &"request".into(), req_fn.as_ref().unchecked_ref());
+    req_fn.forget();
 
     for alias in ["execute", "executeCommand"] {
         let ex_tx = tx.clone();
@@ -170,92 +273,203 @@ pub fn install_rpc(ctx: egui::Context, inbox: Inbox, capabilities: Vec<String>) 
             let body = json!({ "command": command, "params": parse_params(&params) });
             dispatch_rpc(ex_tx.clone(), ex_ctx.clone(), "engine.execute".to_string(), body)
         });
-        let _ = Reflect::set(&handle, &JsValue::from_str(alias), ex_fn.as_ref().unchecked_ref());
+        let _ = Reflect::set(handle, &JsValue::from_str(alias), ex_fn.as_ref().unchecked_ref());
         ex_fn.forget();
     }
 
-    {
-        let caps = capabilities;
+    for alias in ["commands", "listCommands"] {
+        let caps = capabilities.clone();
         let cmd_fn = Closure::<dyn Fn() -> Promise>::new(move || {
             let arr: Vec<Value> = caps.iter().cloned().map(Value::String).collect();
             future_to_promise(async move { Ok(to_js(&Value::Array(arr))) })
         });
-        let _ = Reflect::set(&handle, &"commands".into(), cmd_fn.as_ref().unchecked_ref());
+        let _ = Reflect::set(handle, &JsValue::from_str(alias), cmd_fn.as_ref().unchecked_ref());
         cmd_fn.forget();
     }
 
+    let desc_q = io_queue.clone();
+    let desc_ctx = ctx.clone();
+    let desc_fn = Closure::<dyn Fn(String) -> Promise>::new(move |command: String| {
+        let q = desc_q.clone();
+        let c = desc_ctx.clone();
+        future_to_promise(async move {
+            let (tx, rx) = channel();
+            q.push(IoJob::Describe { command, tx });
+            c.request_repaint();
+            loop {
+                match rx.try_recv() {
+                    Ok(val) => return Ok(to_js(&val)),
+                    Err(TryRecvError::Empty) => sleep_ms(16).await,
+                    Err(TryRecvError::Disconnected) => return Err(JsValue::from_str("describe request dropped")),
+                }
+            }
+        })
+    });
+    let _ = Reflect::set(handle, &"describeCommand".into(), desc_fn.as_ref().unchecked_ref());
+    desc_fn.forget();
+}
+
+fn install_inspect_fns(handle: &Object, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
     for alias in ["docInspect", "inspect"] {
         let doc_tx = tx.clone();
         let doc_ctx = ctx.clone();
         let doc_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
             dispatch_rpc(doc_tx.clone(), doc_ctx.clone(), "document.inspect".to_string(), parse_params(&params))
         });
-        let _ = Reflect::set(&handle, &JsValue::from_str(alias), doc_fn.as_ref().unchecked_ref());
+        let _ = Reflect::set(handle, &JsValue::from_str(alias), doc_fn.as_ref().unchecked_ref());
         doc_fn.forget();
     }
 
-    {
-        let ui_tx = tx.clone();
-        let ui_ctx = ctx.clone();
-        let ui_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
-            dispatch_rpc(ui_tx.clone(), ui_ctx.clone(), "ui.inspect".to_string(), parse_params(&params))
-        });
-        let _ = Reflect::set(&handle, &"uiInspect".into(), ui_fn.as_ref().unchecked_ref());
-        ui_fn.forget();
-    }
+    let ui_tx = tx.clone();
+    let ui_ctx = ctx.clone();
+    let ui_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
+        dispatch_rpc(ui_tx.clone(), ui_ctx.clone(), "ui.inspect".to_string(), parse_params(&params))
+    });
+    let _ = Reflect::set(handle, &"uiInspect".into(), ui_fn.as_ref().unchecked_ref());
+    ui_fn.forget();
 
-    {
-        let shot_tx = tx.clone();
-        let shot_ctx = ctx.clone();
-        let shot_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
-            let tx = shot_tx.clone();
-            let ctx = shot_ctx.clone();
-            let mut p = parse_params(&params);
-            if let Some(obj) = p.as_object_mut() {
-                obj.entry("data").or_insert(Value::Bool(true));
+    let shot_tx = tx.clone();
+    let shot_ctx = ctx.clone();
+    let shot_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |params: JsValue| {
+        let tx = shot_tx.clone();
+        let ctx = shot_ctx.clone();
+        let mut p = parse_params(&params);
+        if let Some(obj) = p.as_object_mut() {
+            obj.entry("data").or_insert(Value::Bool(true));
+        }
+        future_to_promise(async move {
+            let val = send_control(tx, ctx, "ui.render".to_string(), p).await?;
+            if let Some(b64) = val.get("pngBase64").and_then(Value::as_str)
+                && let Ok(bytes) = decode_base64(b64)
+            {
+                return Ok(Uint8Array::from(bytes.as_slice()).into());
             }
-            future_to_promise(async move {
-                let val = send_control(tx, ctx, "ui.render".to_string(), p).await?;
-                if let Some(b64) = val.get("pngBase64").and_then(Value::as_str)
-                    && let Ok(bytes) = decode_base64(b64)
-                {
-                    return Ok(Uint8Array::from(bytes.as_slice()).into());
-                }
-                Ok(Uint8Array::from([0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A].as_slice()).into())
-            })
-        });
-        let _ = Reflect::set(&handle, &"screenshot".into(), shot_fn.as_ref().unchecked_ref());
-        shot_fn.forget();
-    }
+            Ok(Uint8Array::from([0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A].as_slice()).into())
+        })
+    });
+    let _ = Reflect::set(handle, &"screenshot".into(), shot_fn.as_ref().unchecked_ref());
+    shot_fn.forget();
+}
 
-    {
-        let open_inbox = inbox;
-        let open_ctx = ctx;
-        let open_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |name: String, bytes: JsValue| {
+fn install_io_fns(handle: &Object, inbox: Inbox, io_queue: &IoQueue, ctx: &egui::Context) {
+    let open_inbox = inbox;
+    let open_ctx = ctx.clone();
+    let open_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |name: String, bytes: JsValue| {
+        let data = Uint8Array::new(&bytes).to_vec();
+        if let Ok(mut guard) = open_inbox.lock() {
+            guard.push((name, data));
+        }
+        open_ctx.request_repaint();
+        future_to_promise(async { Ok(JsValue::TRUE) })
+    });
+    let _ = Reflect::set(handle, &"open".into(), open_fn.as_ref().unchecked_ref());
+    open_fn.forget();
+
+    let handoff_fn = Closure::<dyn Fn(String, String, String, JsValue)>::new(
+        |target_shore: String, artifact_name: String, format: String, bytes: JsValue| {
             let data = Uint8Array::new(&bytes).to_vec();
-            if let Ok(mut guard) = open_inbox.lock() {
-                guard.push((name, data));
+            emit_handoff(&target_shore, &artifact_name, &format, &data);
+        },
+    );
+    let _ = Reflect::set(handle, &"emitHandoff".into(), handoff_fn.as_ref().unchecked_ref());
+    handoff_fn.forget();
+
+    install_native_io_object(handle, io_queue, ctx);
+}
+
+fn install_native_io_object(handle: &Object, io_queue: &IoQueue, ctx: &egui::Context) {
+    let io_obj = Object::new();
+
+    let formats_fn = Closure::<dyn Fn() -> Promise>::new(|| {
+        future_to_promise(async {
+            let arr: Vec<Value> = EXPORT_FORMATS.iter().map(|f| Value::String((*f).to_string())).collect();
+            Ok(to_js(&Value::Array(arr)))
+        })
+    });
+    let _ = Reflect::set(&io_obj, &"formats".into(), formats_fn.as_ref().unchecked_ref());
+    formats_fn.forget();
+
+    let exp_q = io_queue.clone();
+    let exp_c = ctx.clone();
+    let export_fn = Closure::<dyn Fn(String, JsValue) -> Promise>::new(move |format: String, params: JsValue| {
+        let q = exp_q.clone();
+        let c = exp_c.clone();
+        let p = parse_params(&params);
+        future_to_promise(async move {
+            let (tx, rx) = channel();
+            q.push(IoJob::Export { format, params: p, tx });
+            c.request_repaint();
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(bytes)) => return Ok(Uint8Array::from(bytes.as_slice()).into()),
+                    Ok(Err(e)) => return Err(JsValue::from_str(&e)),
+                    Err(TryRecvError::Empty) => sleep_ms(16).await,
+                    Err(TryRecvError::Disconnected) => return Err(JsValue::from_str("export request dropped")),
+                }
             }
-            open_ctx.request_repaint();
-            future_to_promise(async { Ok(JsValue::TRUE) })
-        });
-        let _ = Reflect::set(&handle, &"open".into(), open_fn.as_ref().unchecked_ref());
-        open_fn.forget();
-    }
+        })
+    });
+    let _ = Reflect::set(&io_obj, &"export".into(), export_fn.as_ref().unchecked_ref());
+    export_fn.forget();
 
-    {
-        let handoff_fn = Closure::<dyn Fn(String, String, String, JsValue)>::new(
-            |target_shore: String, artifact_name: String, format: String, bytes: JsValue| {
-                let data = Uint8Array::new(&bytes).to_vec();
-                emit_handoff(&target_shore, &artifact_name, &format, &data);
-            },
-        );
-        let _ = Reflect::set(&handle, &"emitHandoff".into(), handoff_fn.as_ref().unchecked_ref());
-        handoff_fn.forget();
-    }
+    let imp_q = io_queue.clone();
+    let imp_c = ctx.clone();
+    let import_fn = Closure::<dyn Fn(JsValue) -> Promise>::new(move |detail: JsValue| {
+        let q = imp_q.clone();
+        let c = imp_c.clone();
+        let parsed = extract_import_detail(&detail);
+        future_to_promise(async move {
+            let (name, bytes) = parsed.map_err(|e| JsValue::from_str(&e))?;
+            let (tx, rx) = channel();
+            q.push(IoJob::Import { name, bytes, tx });
+            c.request_repaint();
+            loop {
+                match rx.try_recv() {
+                    Ok(Ok(val)) => return Ok(to_js(&val)),
+                    Ok(Err(e)) => return Err(JsValue::from_str(&e)),
+                    Err(TryRecvError::Empty) => sleep_ms(16).await,
+                    Err(TryRecvError::Disconnected) => return Err(JsValue::from_str("import request dropped")),
+                }
+            }
+        })
+    });
+    let _ = Reflect::set(&io_obj, &"import".into(), import_fn.as_ref().unchecked_ref());
+    import_fn.forget();
 
-    let _ = Reflect::set(&window, &JsValue::from_str(HOST_KEY), &handle);
-    rx
+    let _ = Reflect::set(handle, &"io".into(), &io_obj);
+}
+
+fn infer_vector_ext(mime: Option<&str>) -> &'static str {
+    match mime.unwrap_or("").to_ascii_lowercase().as_str() {
+        "application/pdf" => "pdf",
+        "application/postscript" | "image/x-eps" => "eps",
+        "image/png" => "png",
+        "application/illustrator" => "ai",
+        _ => "svg",
+    }
+}
+
+fn extract_import_detail(detail: &JsValue) -> Result<(String, Vec<u8>), String> {
+    let mime = Reflect::get(detail, &"mimeType".into())
+        .ok()
+        .and_then(|v| v.as_string());
+    let raw_name = Reflect::get(detail, &"name".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let name = match raw_name {
+        Some(n) if n.contains('.') => n,
+        Some(n) => format!("{n}.{}", infer_vector_ext(mime.as_deref())),
+        None => format!("artwork.{}", infer_vector_ext(mime.as_deref())),
+    };
+    let bytes_val = Reflect::get(detail, &"bytes".into())
+        .map_err(|_| "import requires a `bytes` Uint8Array".to_string())?;
+    let bytes = Uint8Array::new(&bytes_val).to_vec();
+    if bytes.is_empty() {
+        return Err("import requires non-empty bytes".to_string());
+    }
+    Ok((name, bytes))
 }
 
 struct Waiting {
